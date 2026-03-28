@@ -2,6 +2,8 @@ const express = require("express");
 const {
   startSession,
   nextQuestion,
+  guidedQuestion,
+  getSessionQueue,
   submitAnswer,
   getHint,
   getProgress,
@@ -15,6 +17,8 @@ const router = express.Router();
 
 router.get("/start-session", startSession);
 router.get("/next-question", nextQuestion);
+router.get("/guided-question", guidedQuestion);
+router.get("/session-queue", getSessionQueue);
 router.post("/submit-answer", submitAnswer);
 router.get("/hint", getHint);
 router.get("/progress", getProgress);

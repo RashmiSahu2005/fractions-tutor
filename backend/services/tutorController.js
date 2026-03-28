@@ -1,8 +1,8 @@
-const { getOrCreateStudent } = require("./db");
-const { persist } = require("./db");
+const { getOrCreateStudent, getOrCreateStudentByName, persist } = require("./db");
 const { createInitialMastery } = require("./learnerModel");
 const { chooseNextQuestion } = require("./decisionEngine");
 const { detectMisconception } = require("./misconceptionEngine");
+const { buildSessionQueue } = require("./sessionQueue");
 const questions = require("../data/questions");
 const { lessons } = require("../data/questions");
 const { updateMastery } = require("./learnerModel");
@@ -21,27 +21,17 @@ function validateStudentId(student_id) {
 }
 
 // ── startSession ─────────────────────────────────────────────────────────────
-// KEY FIX: Only pass mastery initial for NEW students.
-// For existing students, getOrCreateStudent ignores the mastery field.
+// Uses NAME as the identity key — same name = same persistent student record.
 async function startSession(req, res) {
-  const requestedId = req.query.student_id;
   const requestedName = req.query.name;
-  const student_id = validateStudentId(requestedId) ? requestedId : null;
+  const name =
+    typeof requestedName === "string" && requestedName.trim()
+      ? requestedName.trim()
+      : "Student";
 
-  const student = getOrCreateStudent(student_id, {
-    mastery: createInitialMastery(),
-    name:
-      typeof requestedName === "string" && requestedName.trim()
-        ? requestedName.trim()
-        : "Student",
-  });
+  const student = getOrCreateStudentByName(name);
 
-  // Update name if provided
-  if (typeof requestedName === "string" && requestedName.trim()) {
-    student.name = requestedName.trim();
-  }
-
-  // Update session start time
+  // Update session metadata
   if (!student.metrics) {
     student.metrics = {
       session_start_time: Date.now(),
@@ -111,6 +101,69 @@ async function nextQuestion(req, res) {
       statement: question.statement || null,
     },
     hintLevel: 0,
+  });
+}
+
+// ── guidedQuestion ────────────────────────────────────────────────────────────
+// Returns the easiest unanswered question for a KC to use in guided practice.
+async function guidedQuestion(req, res) {
+  const { kc } = req.query;
+  if (!kc) return res.status(400).json({ error: "Missing kc" });
+
+  const kcQuestions = questions.filter((q) => q.kc === kc);
+  // Pick easiest (difficulty 1) first, then 2, then 3
+  const sorted = [...kcQuestions].sort((a, b) => (a.difficulty || 1) - (b.difficulty || 1));
+  const q = sorted[0];
+  if (!q) return res.status(404).json({ error: "No questions found for kc" });
+
+  res.json({
+    question: {
+      id: q.id,
+      prompt: q.prompt,
+      visual: q.visual || null,
+      visual2: q.visual2 || null,
+      type: q.type || "mcq",
+      kc: q.kc,
+      difficulty: q.difficulty,
+      options: q.options || null,
+      hints: q.hints || [],
+      statement: q.statement || null,
+      explanationCorrect: q.explanationCorrect,
+    },
+  });
+}
+
+// ── sessionQueue ──────────────────────────────────────────────────────────────
+// Returns 8 adaptively-selected questions for a student's KC session.
+async function getSessionQueue(req, res) {
+  const { student_id, kc } = req.query;
+  if (!validateStudentId(student_id)) {
+    return res.status(400).json({ error: "Missing or invalid student_id" });
+  }
+  if (!kc) return res.status(400).json({ error: "Missing kc" });
+
+  const student = getOrCreateStudent(student_id);
+
+  const queue = buildSessionQueue({
+    kc,
+    allQuestions: questions,
+    history: student.history || [],
+    mastery: student.mastery,
+    metrics: student.metrics || {},
+  });
+
+  res.json({
+    queue: queue.map((q) => ({
+      id: q.id,
+      prompt: q.prompt,
+      visual: q.visual || null,
+      visual2: q.visual2 || null,
+      type: q.type || "mcq",
+      kc: q.kc,
+      difficulty: q.difficulty,
+      options: q.options || null,
+      statement: q.statement || null,
+    })),
   });
 }
 
@@ -192,7 +245,6 @@ async function submitAnswer(req, res) {
       ? question.explanationCorrect
       : question.explanationsByMisconception[code]?.text || question.explanationIncorrectFallback;
 
-  // ── Persist detailed metrics ──────────────────────────────────────────────
   const now = Date.now();
   if (!student.metrics)
     student.metrics = {
@@ -203,7 +255,7 @@ async function submitAnswer(req, res) {
       misconception_frequency: { F001: 0, F002: 0, F003: 0, F004: 0 },
     };
 
-  // Time taken for this question
+  // Store time taken
   if (typeof time_taken === "number" && time_taken > 0) {
     student.metrics.time_taken_per_question[question_id] = time_taken;
   } else if (student.current?.startedAt) {
@@ -211,13 +263,11 @@ async function submitAnswer(req, res) {
   }
   student.metrics.question_timestamp[question_id] = now;
 
-  // Misconception frequency
   if (!correct && code) {
     const freq = student.metrics.misconception_frequency || {};
     freq[code] = (freq[code] || 0) + 1;
     student.metrics.misconception_frequency = freq;
   }
-  // ─────────────────────────────────────────────────────────────────────────
 
   student.history = student.history || [];
   student.history.push({
@@ -229,14 +279,12 @@ async function submitAnswer(req, res) {
     misconception: code || null,
     hints_used: hintsUsed,
     attempts,
-    updated_mastery: updated_mastery,
+    updated_mastery,
     time_taken: student.metrics.time_taken_per_question[question_id] || null,
   });
 
-  // ── Persist question state ────────────────────────────────────────────────
   if (!student.questionStates) student.questionStates = {};
   student.questionStates[question_id] = correct ? "correct" : "incorrect";
-  // ─────────────────────────────────────────────────────────────────────────
 
   if (student.current?.question_id === question_id) {
     student.current.hintLevel = 0;
@@ -244,7 +292,7 @@ async function submitAnswer(req, res) {
     student.current.attempts = 0;
   }
 
-  // Remediation trigger: same misconception appears twice in last 5 attempts.
+  // Remediation trigger
   let remediation = null;
   if (!correct && code) {
     const recentSame = student.history
@@ -266,11 +314,25 @@ async function submitAnswer(req, res) {
 
   persist();
 
+  // Response-time feedback string
+  const timeTakenMs =
+    typeof time_taken === "number" && time_taken > 0
+      ? time_taken
+      : student.metrics.time_taken_per_question[question_id];
+  let responseTimeFeedback = null;
+  if (typeof timeTakenMs === "number") {
+    const secs = Math.round(timeTakenMs / 1000);
+    if (secs < 15 && correct) responseTimeFeedback = `Great speed — answered in ${secs}s!`;
+    else if (secs > 45) responseTimeFeedback = `Took ${secs}s — try to work a bit faster next time.`;
+    else responseTimeFeedback = `Answered in ${secs}s.`;
+  }
+
   res.json({
     correct,
     misconception: code || null,
     updated_mastery,
     remediation,
+    responseTimeFeedback,
     feedback: {
       message: correct ? question.feedbackCorrect : question.feedbackIncorrect,
       explanation,
@@ -303,7 +365,6 @@ async function getHint(req, res) {
   const question = questions.find((q) => q.id === question_id);
   if (!question) return res.status(404).json({ error: "Unknown question_id" });
 
-  // Ensure current question matches; otherwise treat as level 0
   if (!student.current || student.current.question_id !== question_id) {
     student.current = { question_id, hintLevel: 0, hintsUsed: 0, attempts: 0, startedAt: Date.now() };
   }
@@ -314,15 +375,9 @@ async function getHint(req, res) {
   student.current.hintsUsed = (student.current.hintsUsed || 0) + 1;
 
   const hintText = question.hints[nextLevel - 1] || "";
-
   persist();
 
-  res.json({
-    question_id,
-    hintLevel: nextLevel,
-    hintText,
-    maxHints,
-  });
+  res.json({ question_id, hintLevel: nextLevel, hintText, maxHints });
 }
 
 // ── getProgress ───────────────────────────────────────────────────────────────
@@ -338,8 +393,9 @@ async function getProgress(req, res) {
     .filter(([, value]) => value >= 75)
     .map(([kc]) => kc);
   const weakAreas = Object.entries(student.mastery || {})
-    .filter(([, value]) => value < 60)
+    .filter(([, value]) => value < 40)
     .map(([kc]) => kc);
+
   const chart = ALL_KCS.map((kc) => {
     const kcHistory = history.filter((h) => h.kc === kc);
     const correct = kcHistory.filter((h) => h.correct).length;
@@ -376,11 +432,9 @@ async function getQuestions(req, res) {
     type: question.type || "mcq",
     kc: question.kc,
     difficulty: question.difficulty,
-    explanationCorrect: question.explanationCorrect,
     options: question.options || null,
     statement: question.statement || null,
   }));
-
   res.json({ questions: payload });
 }
 
@@ -399,7 +453,6 @@ async function saveQuestionStates(req, res) {
   const student = getOrCreateStudent(student_id);
   if (!student.questionStates) student.questionStates = {};
 
-  // Merge: only update states that are meaningful (correct/incorrect/skipped override unvisited)
   if (questionStates && typeof questionStates === "object") {
     for (const [qid, state] of Object.entries(questionStates)) {
       student.questionStates[qid] = state;
@@ -430,6 +483,8 @@ async function markLessonViewed(req, res) {
 module.exports = {
   startSession,
   nextQuestion,
+  guidedQuestion,
+  getSessionQueue,
   submitAnswer,
   getHint,
   getProgress,

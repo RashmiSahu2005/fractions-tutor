@@ -19,7 +19,8 @@ const useTutorStore = create((set, get) => ({
   student_id: null,
   name: "",
 
-  mastery: Object.fromEntries(ALL_KCS.map((k) => [k, 20])),
+  // All KC mastery starts at 0 for new students
+  mastery: Object.fromEntries(ALL_KCS.map((k) => [k, 0])),
   profile: null,
 
   currentQuestion: emptyQuestion,
@@ -32,30 +33,21 @@ const useTutorStore = create((set, get) => ({
   status: "idle",
   error: null,
 
-  // ── New fields ────────────────────────────────────────────────────────────
-  // Active KC the student is currently working on
   activeKC: "KC1",
-
-  // Lesson phase: "lesson" | "questions"
   lessonPhase: "lesson",
-
-  // Lesson content loaded from backend: { KC1: { title, explanation, example }, ... }
   lessons: {},
-
-  // Which KCs the student has already seen the lesson for (this session)
   lessonsViewed: [],
 
-  // Persisted question states: { [question_id]: "correct"|"incorrect"|"skipped"|"unvisited" }
   questionStates: {},
-
-  // All questions list (pre-loaded)
   allQuestions: [],
 
-  // KC_TITLES map (exposed for consumers)
+  // Session queue: 8 adaptively-selected questions for the current KC
+  sessionQueue: [],
+
   KC_TITLES,
   ALL_KCS,
-  // ─────────────────────────────────────────────────────────────────────────
 
+  // ── startSession ──────────────────────────────────────────────────────────
   startSession: async (name) => {
     set({ status: "loading", error: null });
     const safeName = encodeURIComponent((name || "Student").trim());
@@ -68,6 +60,10 @@ const useTutorStore = create((set, get) => ({
       questionStates: data.questionStates || {},
       lessonsViewed: data.lessonsViewed || [],
       status: "ready",
+      // Reset session-local state for a clean start
+      sessionQueue: [],
+      activeKC: "KC1",
+      lessonPhase: (data.lessonsViewed || []).includes("KC1") ? "questions" : "lesson",
     });
   },
 
@@ -102,6 +98,23 @@ const useTutorStore = create((set, get) => ({
     }
   },
 
+  // Fetch 8 adaptive questions for a KC session
+  fetchSessionQueue: async (kc) => {
+    const { student_id } = get();
+    if (!student_id || !kc) return [];
+    try {
+      const data = await api.get(
+        `/api/session-queue?student_id=${encodeURIComponent(student_id)}&kc=${encodeURIComponent(kc)}`
+      );
+      const queue = data.queue || [];
+      set({ sessionQueue: queue });
+      return queue;
+    } catch (e) {
+      console.error("fetchSessionQueue error:", e);
+      return [];
+    }
+  },
+
   markLessonViewed: async (kc) => {
     const { student_id, lessonsViewed } = get();
     if (lessonsViewed.includes(kc)) return;
@@ -118,9 +131,15 @@ const useTutorStore = create((set, get) => ({
 
   setActiveKC: (kc) => {
     const { lessonsViewed } = get();
-    // If student has already seen this lesson, skip directly to questions
     const phase = lessonsViewed.includes(kc) ? "questions" : "lesson";
-    set({ activeKC: kc, lessonPhase: phase, feedback: null, hintTexts: [], hintLevel: 0 });
+    set({
+      activeKC: kc,
+      lessonPhase: phase,
+      feedback: null,
+      hintTexts: [],
+      hintLevel: 0,
+      sessionQueue: [], // will be re-fetched for new KC
+    });
   },
 
   setLessonPhase: (phase) => set({ lessonPhase: phase }),
@@ -131,7 +150,7 @@ const useTutorStore = create((set, get) => ({
 
     set({ status: "loading", feedback: null, hintTexts: [], hintLevel: 0 });
     const data = await api.get(
-      `/api/next-question?student_id=${encodeURIComponent(student_id)}&active_kc=${encodeURIComponent(activeKC || "KC1")}`,
+      `/api/next-question?student_id=${encodeURIComponent(student_id)}&active_kc=${encodeURIComponent(activeKC || "KC1")}`
     );
 
     set({
@@ -157,7 +176,6 @@ const useTutorStore = create((set, get) => ({
       time_taken: time_taken || null,
     });
 
-    // Update persisted question state
     const newState = data.correct ? "correct" : "incorrect";
     set((prev) => ({
       mastery: data.updated_mastery,
@@ -166,35 +184,9 @@ const useTutorStore = create((set, get) => ({
         correct: data.correct,
         misconception: data.misconception,
         remediation: data.remediation || null,
+        responseTimeFeedback: data.responseTimeFeedback || null,
       },
       questionStates: { ...prev.questionStates, [question_id]: newState },
-      status: "ready",
-    }));
-
-    return data;
-  },
-
-  submitAnswer: async (selected_option) => {
-    const { student_id, currentQuestion } = get();
-    if (!student_id || !currentQuestion) throw new Error("Missing session or question");
-
-    set({ status: "loading", error: null });
-    const data = await api.post("/api/submit-answer", {
-      student_id,
-      question_id: currentQuestion.id,
-      selected_option,
-    });
-
-    const newState = data.correct ? "correct" : "incorrect";
-    set((prev) => ({
-      mastery: data.updated_mastery,
-      feedback: {
-        ...data.feedback,
-        correct: data.correct,
-        misconception: data.misconception,
-        remediation: data.remediation || null,
-      },
-      questionStates: { ...prev.questionStates, [currentQuestion.id]: newState },
       status: "ready",
     }));
 
@@ -223,40 +215,14 @@ const useTutorStore = create((set, get) => ({
     if (!student_id || !question_id) throw new Error("Missing session or question");
 
     const data = await api.get(
-      `/api/hint?student_id=${encodeURIComponent(student_id)}&question_id=${encodeURIComponent(question_id)}`,
+      `/api/hint?student_id=${encodeURIComponent(student_id)}&question_id=${encodeURIComponent(question_id)}`
     );
 
     const level = data.hintLevel ?? 1;
     const texts = [...(get().hintTexts || [])];
     texts[level - 1] = data.hintText;
 
-    set({
-      hintLevel: level,
-      hintTexts: texts,
-    });
-
-    return data;
-  },
-
-  requestHint: async () => {
-    const { student_id, currentQuestion } = get();
-    if (!student_id || !currentQuestion) throw new Error("Missing session or question");
-
-    const data = await api.get(
-      `/api/hint?student_id=${encodeURIComponent(student_id)}&question_id=${encodeURIComponent(
-        currentQuestion.id,
-      )}`,
-    );
-
-    const level = data.hintLevel ?? 1;
-    const texts = [...(get().hintTexts || [])];
-    texts[level - 1] = data.hintText;
-
-    set({
-      hintLevel: level,
-      hintTexts: texts,
-    });
-
+    set({ hintLevel: level, hintTexts: texts });
     return data;
   },
 
@@ -268,7 +234,7 @@ const useTutorStore = create((set, get) => ({
       hintLevel: 0,
       hintTexts: [],
       feedback: null,
-      mastery: Object.fromEntries(ALL_KCS.map((k) => [k, 20])),
+      mastery: Object.fromEntries(ALL_KCS.map((k) => [k, 0])),
       profile: null,
       status: "idle",
       error: null,
@@ -278,6 +244,7 @@ const useTutorStore = create((set, get) => ({
       lessonsViewed: [],
       questionStates: {},
       allQuestions: [],
+      sessionQueue: [],
     });
   },
 }));
